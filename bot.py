@@ -529,32 +529,54 @@ class CapitalBot:
     def get_rest_market_quote(self):
         """Obtiene bid/offer actuales mediante REST (independiente del WS)."""
         data = self.request("GET", f"/api/v1/markets/{EPIC}")
-        markets = data.get("markets") or []
 
-        market = None
-        if markets:
-            market = next(
-                (item for item in markets if item.get("epic") == EPIC),
-                markets[0],
-            )
-        elif isinstance(data.get("market"), dict):
-            market = data["market"]
-        elif "bid" in data or "offer" in data:
-            market = data
+        # La respuesta de Capital.com puede venir como:
+        # {"instrument": {...}, "snapshot": {...}}
+        # o como {"instrument": {"snapshot": {...}}}, según el formato.
+        # En el formato recibido en los registros, la cotización está en
+        # data["snapshot"] y también puede estar anidada en instrument.
+        candidates = []
 
-        if not market:
+        if isinstance(data, dict):
+            if isinstance(data.get("snapshot"), dict):
+                candidates.append(data["snapshot"])
+
+            instrument = data.get("instrument")
+            if isinstance(instrument, dict):
+                if isinstance(instrument.get("snapshot"), dict):
+                    candidates.append(instrument["snapshot"])
+
+            markets = data.get("markets") or []
+            for item in markets:
+                if isinstance(item, dict):
+                    if isinstance(item.get("snapshot"), dict):
+                        candidates.append(item["snapshot"])
+                    candidates.append(item)
+
+            if isinstance(data.get("market"), dict):
+                market = data["market"]
+                if isinstance(market.get("snapshot"), dict):
+                    candidates.append(market["snapshot"])
+                candidates.append(market)
+
+            candidates.append(data)
+
+        quote = next(
+            (
+                item for item in candidates
+                if item.get("bid") is not None
+                and item.get("offer") is not None
+            ),
+            None,
+        )
+
+        if quote is None:
             raise RuntimeError(
-                f"La API no devolvió cotización REST para {EPIC}: {data}"
+                f"La API no devolvió bid/offer para {EPIC}. "
+                f"Claves recibidas: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}"
             )
 
-        bid = market.get("bid")
-        offer = market.get("offer")
-        if bid is None or offer is None:
-            raise RuntimeError(
-                f"Cotización REST incompleta para {EPIC}: {market}"
-            )
-
-        return float(bid), float(offer)
+        return float(quote["bid"]), float(quote["offer"])
 
     def position_is_open(self, deal_id):
         """Comprueba el estado real de un deal en la lista de posiciones."""
@@ -1263,3 +1285,4 @@ if __name__ == "__main__":
         logging.info("Bot detenido")
     except Exception:
         logging.exception("No se pudo iniciar el bot")
+
