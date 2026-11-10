@@ -1,0 +1,39 @@
+Capital.com Trading Bot — Project Notes
+Environment
+Platform: Windows, Visual Studio Code
+Language: Python
+Virtual environment: .venv
+API: Capital.com DEMO
+Main file: bot.py
+Credentials: stored in .env (never share these)
+Market and strategy
+Instrument: US Tech 100
+EPIC: US100
+Candle timeframe: 1 minute (MINUTE)
+Strategy: Bollinger Bands, 20 periods, 2 standard deviations
+BUY: candle opens below the lower band and closes above it
+SELL: candle opens above the upper band and closes below it
+Maximum one open US100 position at a time
+Position size: 1
+Stop loss distance: 10 points
+Take profit distance: 10 points
+Automation
+Bot runs continuously.
+Polling interval: 30 seconds.
+It should process each completed candle only once.
+ENABLE_DEMO_TRADING=true enables attempted demo orders.
+Account balance should display at startup and every 5 minutes.
+API
+Demo base URL: https://demo-api-capital.backend-capital.com
+Session: POST /api/v1/session
+Prices: GET /api/v1/prices/US100
+Positions: GET /api/v1/positions
+Accounts: GET /api/v1/accounts
+Open position: POST /api/v1/positions
+Confirm order: GET /api/v1/confirms/{dealReference}
+Next steps
+Verify the balance display updates every 5 minutes.
+Verify demo orders are accepted and actually open.
+Verify stop loss and take profit are applied to each position.
+Improve recovery after network errors to avoid duplicate orders.
+Keep the bot on demo until the execution and risk controls are thoroughly tested.
