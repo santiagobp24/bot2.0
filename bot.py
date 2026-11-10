@@ -85,6 +85,13 @@ class CapitalBot:
         self.take_profit_last_attempt = 0.0
         self.take_profit_closing = False
 
+        # Control del vigilante independiente de Stop Loss de emergencia.
+        # Este monitor consulta posiciones y cotizaciones por REST, incluso
+        # cuando el WebSocket está desconectado.
+        self.stop_monitor_lock = threading.Lock()
+        self.emergency_closing_ids = set()
+        self.stop_monitor_interval = 2.0
+
     def move_stop_to_breakeven(self, deal_id, entry_price):
         # Esperar un minuto desde la apertura confirmada.
         time.sleep(60)
@@ -519,6 +526,200 @@ class CapitalBot:
             for p in positions
         )
 
+    def get_rest_market_quote(self):
+        """Obtiene bid/offer actuales mediante REST (independiente del WS)."""
+        data = self.request("GET", f"/api/v1/markets/{EPIC}")
+        markets = data.get("markets") or []
+
+        market = None
+        if markets:
+            market = next(
+                (item for item in markets if item.get("epic") == EPIC),
+                markets[0],
+            )
+        elif isinstance(data.get("market"), dict):
+            market = data["market"]
+        elif "bid" in data or "offer" in data:
+            market = data
+
+        if not market:
+            raise RuntimeError(
+                f"La API no devolvió cotización REST para {EPIC}: {data}"
+            )
+
+        bid = market.get("bid")
+        offer = market.get("offer")
+        if bid is None or offer is None:
+            raise RuntimeError(
+                f"Cotización REST incompleta para {EPIC}: {market}"
+            )
+
+        return float(bid), float(offer)
+
+    def position_is_open(self, deal_id):
+        """Comprueba el estado real de un deal en la lista de posiciones."""
+        data = self.request("GET", "/api/v1/positions")
+        return any(
+            item.get("position", {}).get("dealId") == deal_id
+            for item in data.get("positions", [])
+        )
+
+    def close_position_emergency(self, deal_id, direction, stop_level):
+        """Cierra una posición por SL y verifica que desapareció de abiertas."""
+        with self.stop_monitor_lock:
+            if deal_id in self.emergency_closing_ids:
+                return
+            self.emergency_closing_ids.add(deal_id)
+
+        try:
+            logging.critical(
+                "STOP LOSS ALCANZADO: enviando cierre de emergencia "
+                "| %s | dealId=%s | stop=%.2f",
+                direction,
+                deal_id,
+                stop_level,
+            )
+
+            result = self.request(
+                "DELETE",
+                f"/api/v1/positions/{deal_id}",
+            )
+            reference = result.get("dealReference")
+
+            if reference:
+                confirmation = self.request(
+                    "GET", f"/api/v1/confirms/{reference}"
+                )
+                logging.info(
+                    "Confirmación de cierre de emergencia: %s",
+                    confirmation,
+                )
+                if confirmation.get("dealStatus") != "ACCEPTED":
+                    logging.error(
+                        "Capital.com no confirmó ACCEPTED el cierre "
+                        "de %s; se volverá a comprobar.",
+                        deal_id,
+                    )
+
+            # No se considera cerrado solo por recibir HTTP 200 o reference.
+            if not self.position_is_open(deal_id):
+                logging.critical(
+                    "CIERRE DE EMERGENCIA VERIFICADO | dealId=%s",
+                    deal_id,
+                )
+                return
+
+            logging.error(
+                "La posición %s sigue abierta después del intento de cierre. "
+                "Se reintentará en el siguiente ciclo.",
+                deal_id,
+            )
+
+        except RuntimeError as exc:
+            # Un 404 puede significar que el broker ya la cerró por su SL/TP.
+            # Se consulta la lista antes de decidir que está cerrada.
+            if "error.not-found.dealId" in str(exc):
+                try:
+                    if not self.position_is_open(deal_id):
+                        logging.info(
+                            "La posición %s ya no aparece abierta; "
+                            "probablemente fue cerrada por Capital.com.",
+                            deal_id,
+                        )
+                        return
+                except Exception:
+                    logging.exception(
+                        "No se pudo verificar el estado de %s tras HTTP 404",
+                        deal_id,
+                    )
+            logging.exception(
+                "Falló el cierre de emergencia de %s; se reintentará.",
+                deal_id,
+            )
+
+        except Exception:
+            logging.exception(
+                "Error inesperado al cerrar por Stop Loss: %s",
+                deal_id,
+            )
+
+        finally:
+            with self.stop_monitor_lock:
+                self.emergency_closing_ids.discard(deal_id)
+
+    def stop_loss_monitor_loop(self):
+        """Vigila el stopLevel real usando REST aunque el WS falle."""
+        logging.info(
+            "Vigilante REST de Stop Loss iniciado para %s "
+            "(intervalo %.1f s)",
+            EPIC,
+            self.stop_monitor_interval,
+        )
+
+        while True:
+            try:
+                positions_data = self.request("GET", "/api/v1/positions")
+                positions = positions_data.get("positions", [])
+
+                # No hace falta consultar el mercado si no hay posición US100.
+                us100_positions = [
+                    item for item in positions
+                    if item.get("market", {}).get("epic") == EPIC
+                ]
+
+                if us100_positions:
+                    bid, offer = self.get_rest_market_quote()
+
+                    for item in us100_positions:
+                        position = item.get("position", {})
+                        deal_id = position.get("dealId")
+                        direction = position.get("direction")
+                        stop_level = position.get("stopLevel")
+
+                        # Si el listado no incluye stopLevel, consultar el detalle.
+                        if stop_level is None and deal_id:
+                            detail = self.request(
+                                "GET", f"/api/v1/positions/{deal_id}"
+                            )
+                            position = detail.get("position", {})
+                            direction = position.get("direction", direction)
+                            stop_level = position.get("stopLevel")
+
+                        if not deal_id or direction not in ("BUY", "SELL"):
+                            logging.warning(
+                                "No se pudo identificar dealId/dirección "
+                                "para una posición %s.", EPIC
+                            )
+                            continue
+
+                        if stop_level is None:
+                            logging.error(
+                                "La posición %s no informa stopLevel. "
+                                "No se puede activar el cierre de emergencia.",
+                                deal_id,
+                            )
+                            continue
+
+                        stop_level = float(stop_level)
+                        hit = (
+                            bid <= stop_level
+                            if direction == "BUY"
+                            else offer >= stop_level
+                        )
+
+                        if hit:
+                            self.close_position_emergency(
+                                deal_id, direction, stop_level
+                            )
+
+            except Exception:
+                logging.exception(
+                    "Error en el vigilante REST de Stop Loss; "
+                    "se volverá a comprobar."
+                )
+
+            time.sleep(self.stop_monitor_interval)
+
     def check_take_profit(self, bid, offer):
         if not self.take_profit_position:
             return
@@ -528,7 +729,6 @@ class CapitalBot:
                 return
 
             trade = self.take_profit_position
-
             if trade["direction"] == "BUY":
                 hit = bid >= trade["target"]
             else:
@@ -537,7 +737,6 @@ class CapitalBot:
             if not hit:
                 return
 
-            # Evitar solicitudes repetidas cada cotización.
             now = time.time()
             if now - self.take_profit_last_attempt < 5:
                 return
@@ -547,18 +746,19 @@ class CapitalBot:
 
         deal_id = trade["deal_id"]
 
+        # Evita que el TP y el vigilante REST del SL cierren el mismo deal
+        # simultáneamente.
+        with self.stop_monitor_lock:
+            if deal_id in self.emergency_closing_ids:
+                with self.take_profit_lock:
+                    self.take_profit_closing = False
+                return
+            self.emergency_closing_ids.add(deal_id)
+
         try:
-            data = self.request("GET", "/api/v1/positions")
-
-            position_exists = any(
-                p.get("position", {}).get("dealId") == deal_id
-                for p in data.get("positions", [])
-            )
-
-            if not position_exists:
+            if not self.position_is_open(deal_id):
                 logging.info(
-                    "La posición %s ya no está abierta. "
-                    "Se desactiva su vigilancia.",
+                    "La posición %s ya no está abierta; vigilancia TP finalizada.",
                     deal_id,
                 )
                 self.take_profit_position = None
@@ -571,42 +771,60 @@ class CapitalBot:
             )
 
             result = self.request(
-                "DELETE",
-                f"/api/v1/positions/{deal_id}",
+                "DELETE", f"/api/v1/positions/{deal_id}"
             )
-
             reference = result.get("dealReference")
 
             if reference:
                 confirmation = self.request(
-                    "GET",
-                    f"/api/v1/confirms/{reference}",
+                    "GET", f"/api/v1/confirms/{reference}"
                 )
-                logging.info(
-                    "Confirmación de cierre: %s",
-                    confirmation,
-                )
+                logging.info("Confirmación de cierre TP: %s", confirmation)
+                if confirmation.get("dealStatus") != "ACCEPTED":
+                    logging.error(
+                        "El cierre TP no fue confirmado como ACCEPTED. "
+                        "Se mantendrá la vigilancia.",
+                    )
 
-            self.take_profit_position = None
+            if not self.position_is_open(deal_id):
+                logging.info("CIERRE TP VERIFICADO | dealId=%s", deal_id)
+                self.take_profit_position = None
+            else:
+                logging.error(
+                    "La posición %s sigue abierta tras el intento TP; "
+                    "se reintentará con la siguiente cotización.",
+                    deal_id,
+                )
 
         except RuntimeError as exc:
             if "error.not-found.dealId" in str(exc):
-                logging.warning(
-                    "Capital.com no encuentra el dealId %s. "
-                    "Se desactiva la vigilancia.",
-                    deal_id,
-                )
-                self.take_profit_position = None
+                try:
+                    if not self.position_is_open(deal_id):
+                        logging.info(
+                            "Capital.com ya no muestra abierta la posición %s.",
+                            deal_id,
+                        )
+                        self.take_profit_position = None
+                    else:
+                        logging.exception(
+                            "Capital.com devolvió 404 pero la posición aún "
+                            "aparece abierta; se mantiene vigilancia TP."
+                        )
+                except Exception:
+                    logging.exception(
+                        "No se pudo verificar la posición tras el 404 del TP."
+                    )
             else:
                 logging.exception(
-                    "Error al cerrar por Take Profit. "
-                    "Se reintentará después de 5 segundos."
+                    "Error al cerrar por Take Profit; se reintentará."
                 )
 
         except Exception:
             logging.exception("Error inesperado en el cierre por Take Profit")
 
         finally:
+            with self.stop_monitor_lock:
+                self.emergency_closing_ids.discard(deal_id)
             with self.take_profit_lock:
                 self.take_profit_closing = False
 
@@ -994,6 +1212,14 @@ class CapitalBot:
 
         threading.Thread(
             target=self.balance_loop, daemon=True
+        ).start()
+
+        # Este hilo no depende del WebSocket y recupera automáticamente
+        # las posiciones abiertas que ya existan al iniciar el bot.
+        threading.Thread(
+            target=self.stop_loss_monitor_loop,
+            daemon=True,
+            name="stop-loss-rest-monitor",
         ).start()
 
         while True:
