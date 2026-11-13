@@ -35,6 +35,8 @@ ENABLE_TRADING = (
 )
 
 BALANCE_INTERVAL = 300
+BALANCE_LOG_FILE = Path(__file__).resolve().parent / "historial_saldo.txt"
+BOLLINGER_LOG_FILE = Path(__file__).resolve().parent / "historial_bollinger.jsonl"
 STATE_FILE = Path("last_signal_minute.txt")
 
 logging.basicConfig(
@@ -242,6 +244,101 @@ class CapitalBot:
     
     
     
+    def save_entry_bollinger(self, deal_id, deal_reference, direction,
+                              entry_price, upper, lower):
+        """Guarda las bandas exactas calculadas al confirmar la apertura."""
+        record = {
+            "dealId": deal_id,
+            "dealReference": deal_reference,
+            "timestampUtc": datetime.now(timezone.utc).isoformat(),
+            "direction": direction,
+            "size": SIZE,
+            "entryPrice": float(entry_price),
+            "upperBand": float(upper),
+            "lowerBand": float(lower),
+        }
+        try:
+            with BOLLINGER_LOG_FILE.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(record, ensure_ascii=False) + "\\n")
+            logging.info(
+                "Bandas de Bollinger guardadas | dealId=%s | superior=%.2f | inferior=%.2f",
+                deal_id, upper, lower,
+            )
+        except OSError:
+            logging.exception("No se pudieron guardar las bandas de Bollinger.")
+
+    @staticmethod
+    def load_entry_bollinger():
+        """Lee el historial local de bandas."""
+        records = []
+        if not BOLLINGER_LOG_FILE.exists():
+            return records
+        try:
+            with BOLLINGER_LOG_FILE.open("r", encoding="utf-8") as file:
+                for line in file:
+                    try:
+                        item = json.loads(line)
+                        if isinstance(item, dict):
+                            records.append(item)
+                    except json.JSONDecodeError:
+                        logging.warning("Línea inválida en %s", BOLLINGER_LOG_FILE)
+        except OSError:
+            logging.exception("No se pudo leer %s", BOLLINGER_LOG_FILE)
+        return records
+
+    @staticmethod
+    def find_entry_bollinger(transaction, records):
+        """Relaciona una transacción con sus bandas guardadas."""
+        transaction_ids = {
+            str(transaction.get(key))
+            for key in ("dealId", "reference", "dealReference", "deal_id")
+            if transaction.get(key) not in (None, "")
+        }
+        for record in reversed(records):
+            record_ids = {
+                str(record.get(key))
+                for key in ("dealId", "dealReference")
+                if record.get(key) not in (None, "")
+            }
+            if transaction_ids & record_ids:
+                return record
+
+        # Si la API no incluye el dealId, intentar por hora y tamaño.
+        raw_date = transaction.get("dateUtc") or transaction.get("date")
+        if not raw_date:
+            return None
+        try:
+            tx_time = datetime.fromisoformat(
+                raw_date.replace("Z", "+00:00")
+            )
+            if tx_time.tzinfo is None:
+                tx_time = tx_time.replace(tzinfo=timezone.utc)
+            tx_time = tx_time.astimezone(timezone.utc)
+        except (ValueError, AttributeError, TypeError):
+            return None
+
+        tx_size = transaction.get("size")
+        candidates = []
+        for record in records:
+            try:
+                record_time = datetime.fromisoformat(
+                    record["timestampUtc"].replace("Z", "+00:00")
+                ).astimezone(timezone.utc)
+            except (KeyError, ValueError, AttributeError, TypeError):
+                continue
+            seconds = abs((tx_time - record_time).total_seconds())
+            if seconds > 120:
+                continue
+            try:
+                if tx_size is not None and abs(
+                    abs(float(tx_size)) - float(record.get("size", SIZE))
+                ) > 1e-8:
+                    continue
+            except (ValueError, TypeError):
+                pass
+            candidates.append((seconds, record))
+        return min(candidates, key=lambda item: item[0])[1] if candidates else None
+
     def show_last_five_operations(self):
         from datetime import datetime, timedelta, timezone
         from zoneinfo import ZoneInfo
@@ -289,6 +386,7 @@ class CapitalBot:
 
         transactions = []
         seen = set()
+        bollinger_records = self.load_entry_bollinger()
 
         for offset in range(5):
             day = first_day + timedelta(days=offset)
@@ -354,6 +452,13 @@ class CapitalBot:
                     ),
                 )
                 print("Tamaño:", t.get("size", "N/D"))
+
+                bollinger = self.find_entry_bollinger(t, bollinger_records)
+                if bollinger:
+                    print("Banda superior al abrir:", f'{bollinger["upperBand"]:.2f}')
+                    print("Banda inferior al abrir:", f'{bollinger["lowerBand"]:.2f}')
+                else:
+                    print("Bandas de Bollinger al abrir: sin registro guardado")
 
                 financial_keys = (
                     "profit",
@@ -850,7 +955,7 @@ class CapitalBot:
             with self.take_profit_lock:
                 self.take_profit_closing = False
 
-    def open_position(self, direction):
+    def open_position(self, direction, upper_band=None, lower_band=None):
         logging.info(
             "open_position() llamada: dirección=%s | ENABLE_TRADING=%s",
             direction,
@@ -920,6 +1025,21 @@ class CapitalBot:
         entry_price = confirmation.get("level")
 
         if deal_id and entry_price is not None:
+            if upper_band is not None and lower_band is not None:
+                self.save_entry_bollinger(
+                    deal_id,
+                    deal_reference,
+                    direction,
+                    entry_price,
+                    upper_band,
+                    lower_band,
+                )
+            else:
+                logging.warning(
+                    "La operación %s fue abierta sin snapshot completo de Bollinger.",
+                    deal_id,
+                )
+
             logging.info(
                 "Protección break-even programada "
                 "| dealId=%s | entrada=%.2f",
@@ -958,9 +1078,9 @@ class CapitalBot:
                 target,
             )
 
-    def execute_signal(self, direction, minute_key):
+    def execute_signal(self, direction, minute_key, upper_band, lower_band):
         try:
-            self.open_position(direction)
+            self.open_position(direction, upper_band, lower_band)
         except Exception:
             logging.exception(
                 "Resultado de orden incierto para %s. "
@@ -970,7 +1090,7 @@ class CapitalBot:
             with self.order_lock:
                 self.order_in_flight = False
 
-    def trigger(self, direction, minute_key, price, band):
+    def trigger(self, direction, minute_key, price, band, upper_band, lower_band):
         # Una sola señal por minuto, incluso si llegan muchos ticks.
         with self.order_lock:
             if self.order_in_flight:
@@ -991,7 +1111,7 @@ class CapitalBot:
 
         threading.Thread(
             target=self.execute_signal,
-            args=(direction, minute_key),
+            args=(direction, minute_key, upper_band, lower_band),
             daemon=True,
         ).start()
 
@@ -1125,6 +1245,8 @@ class CapitalBot:
                 period_key,
                 price,
                 lower,
+                upper,
+                lower,
             )
 
         # SELL: precio por encima de la banda superior.
@@ -1134,6 +1256,8 @@ class CapitalBot:
                 period_key,
                 price,
                 upper,
+                upper,
+                lower,
             )
 
         else:
@@ -1213,14 +1337,44 @@ class CapitalBot:
 
                 for account in data.get("accounts", []):
                     balance = account.get("balance", {})
+                    account_name = account.get("accountName", "Cuenta")
+                    account_balance = balance.get("balance", "N/D")
+                    available = balance.get("available", "N/D")
+                    profit_loss = balance.get("profitLoss", "N/D")
 
                     logging.info(
                         "Saldo %s: %s | Disponible: %s | P/L: %s",
-                        account.get("accountName", "Cuenta"),
-                        balance.get("balance", "N/D"),
-                        balance.get("available", "N/D"),
-                        balance.get("profitLoss", "N/D"),
+                        account_name,
+                        account_balance,
+                        available,
+                        profit_loss,
                     )
+
+                    # Guardar cada lectura al final del archivo, sin borrar
+                    # los registros anteriores. La hora usa la zona local
+                    # configurada en el equipo donde se ejecuta el bot.
+                    timestamp = datetime.now().astimezone().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                    try:
+                        file_is_new = (
+                            not BALANCE_LOG_FILE.exists()
+                            or BALANCE_LOG_FILE.stat().st_size == 0
+                        )
+                        with BALANCE_LOG_FILE.open("a", encoding="utf-8") as log_file:
+                            if file_is_new:
+                                log_file.write(
+                                    "Fecha y hora | Cuenta | Account | Available | P/L\n"
+                                )
+                            log_file.write(
+                                f"{timestamp} | {account_name} | "
+                                f"{account_balance} | {available} | {profit_loss}\n"
+                            )
+                    except OSError:
+                        logging.exception(
+                            "No se pudo guardar el historial de saldo en %s",
+                            BALANCE_LOG_FILE,
+                        )
 
             except Exception:
                 logging.exception("No se pudo actualizar el saldo")
