@@ -37,6 +37,7 @@ ENABLE_TRADING = (
 BALANCE_INTERVAL = 300
 BALANCE_LOG_FILE = Path(__file__).resolve().parent / "historial_saldo.txt"
 BOLLINGER_LOG_FILE = Path(__file__).resolve().parent / "historial_bollinger.jsonl"
+DIRECTION_LOG_FILE = Path(__file__).resolve().parent / "historial_direcciones.jsonl"
 STATE_FILE = Path("last_signal_minute.txt")
 
 logging.basicConfig(
@@ -93,6 +94,29 @@ class CapitalBot:
         self.stop_monitor_lock = threading.Lock()
         self.emergency_closing_ids = set()
         self.stop_monitor_interval = 2.0
+
+    def save_entry_direction(self, deal_id, deal_reference, direction):
+        record = {
+            "dealId": deal_id,
+            "dealReference": deal_reference,
+            "timestampUtc": datetime.now(timezone.utc).isoformat(),
+            "direction": direction.upper(),
+            "epic": EPIC,
+            "size": SIZE,
+        }
+
+        try:
+            with DIRECTION_LOG_FILE.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+            logging.info(
+                "DIRECCIÓN GUARDADA | %s | dealId=%s",
+                direction,
+                deal_id,
+            )
+
+        except OSError:
+            logging.exception("No se pudo guardar la dirección de la operación.")
 
     def move_stop_to_breakeven(self, deal_id, entry_price):
         # Esperar un minuto desde la apertura confirmada.
@@ -388,6 +412,21 @@ class CapitalBot:
         seen = set()
         bollinger_records = self.load_entry_bollinger()
 
+        # Cargar el historial independiente de direcciones BUY/SELL.
+        direction_records = []
+
+        if DIRECTION_LOG_FILE.exists():
+            with DIRECTION_LOG_FILE.open("r", encoding="utf-8") as file:
+                for line in file:
+                    try:
+                        record = json.loads(line.strip())
+                        if record.get("dealId"):
+                            direction_records.append(record)
+                    except json.JSONDecodeError:
+                        logging.warning(
+                            "Registro inválido en historial_direcciones.jsonl"
+                        )
+
         for offset in range(5):
             day = first_day + timedelta(days=offset)
 
@@ -460,6 +499,25 @@ class CapitalBot:
                 else:
                     print("Bandas de Bollinger al abrir: sin registro guardado")
 
+                # Buscar la dirección original en el archivo independiente.
+                direction_record = None
+
+                transaction_deal_id = t.get("dealId") or t.get("deal_id")
+
+                if transaction_deal_id is not None:
+                    for record in reversed(direction_records):
+                        if str(record.get("dealId")) == str(transaction_deal_id):
+                            direction_record = record
+                            break
+
+                if direction_record:
+                    print(
+                        "Dirección original:",
+                        direction_record.get("direction", "NO IDENTIFICADA")
+                    )
+                else:
+                    print("Dirección original: NO IDENTIFICADA")
+
                 financial_keys = (
                     "profit",
                     "profitAndLoss",
@@ -480,10 +538,7 @@ class CapitalBot:
                         found = True
 
                 if not found:
-                    print(
-                        "Resultado monetario por operación: "
-                        "no incluido en esta respuesta de la API."
-                    )
+                    return 0
 
         print("\n=== RESUMEN ===")
         print(f"Transacciones: {len(transactions)}")
@@ -1024,6 +1079,17 @@ class CapitalBot:
 
         entry_price = confirmation.get("level")
 
+        if deal_id:
+            self.save_entry_direction(
+                deal_id,
+                deal_reference,
+                direction,
+            )
+        else:
+            logging.warning(
+                "No se pudo guardar la dirección: falta el dealId confirmado."
+            )
+
         if deal_id and entry_price is not None:
             if upper_band is not None and lower_band is not None:
                 self.save_entry_bollinger(
@@ -1238,10 +1304,10 @@ class CapitalBot:
             upper,
         )
 
-        # BUY: precio por debajo de la banda inferior.
+        # SELL: precio por debajo de la banda inferior.
         if price < lower:
             self.trigger(
-                "BUY",
+                "SELL",
                 period_key,
                 price,
                 lower,
@@ -1249,10 +1315,10 @@ class CapitalBot:
                 lower,
             )
 
-        # SELL: precio por encima de la banda superior.
+        # BUY: precio por encima de la banda superior.
         elif price > upper:
             self.trigger(
-                "SELL",
+                "BUY",
                 period_key,
                 price,
                 upper,
